@@ -1,0 +1,7 @@
+mod_log_rotate_subdir is modified version of mod_log_rotate that enables to create sub directory.
+
+httpd.conf
+ LoadModule log_rotate_module modules/mod_log_rotate.so
+ RotateLogs On
+ RotateLogsLocalTime On
+ CustomLog "/var/log/httpd/site/%Y/%m/access.log.%d"
