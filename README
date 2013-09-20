@@ -5,3 +5,7 @@ httpd.conf
  RotateLogs On
  RotateLogsLocalTime On
  CustomLog "/var/log/httpd/site/%Y/%m/access.log.%d"
+
+ RotateLogsHardLink "/var/log/httpd/site/%Y/%m/access.log.%d" "/var/log/httpd/site/access.current.log"
+
+ LogFormat "{\"date\": \"%t\", \"tm\": \"%{%s}t\", \"apache\": {\"client\": \"%a\", \"server\": \"%A\", \"duration\": %T.%D, \"request\":\"%r\",\"status\": %s, \"byte\": %b,     \"path\": \"%U%q\", \"method\": \"%m\", \"referrer\": \"%{Referer}i\", \"ua\": \"%{User-Agent}i\"}, \"cookie\":{}, \"tracking\": %{tracking}j, \"application\": %{application}J }" apache_json
