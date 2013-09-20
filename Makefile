@@ -1,4 +1,4 @@
-APXS=/usr/sbin/apxs
+APXS=/usr/bin/apxs2
 
 mod_log_rotate.so:
 	$(APXS) -c mod_log_rotate.c

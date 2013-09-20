@@ -1,3 +1,4 @@
+/* vim: set expandtab tabstop=4 shiftwidth=4 softtabstop=4 filetype=c: */
 /* Copyright 1999-2004 The Apache Software Foundation
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -46,6 +47,7 @@
 #include "apr_pools.h"
 #include "apr_strings.h"
 #include "apr_time.h"
+#include "apr_hash.h"
 
 #include "httpd.h"
 #include "http_config.h"
@@ -53,6 +55,7 @@
 #include "ap_mpm.h"
 
 #include "mod_log_config.h"
+#include "test_char.h"
 
 #ifndef APR_LARGEFILE
 #define APR_LARGEFILE 0
@@ -71,6 +74,7 @@ typedef struct {
     apr_time_t      interval;       /* Rotation interval                    */
     apr_time_t      offset;         /* Offset from midnight                 */
     int             localt;         /* Use local time instead of GMT        */
+    apr_hash_t      *hardlinks;     /* hardlink settings */
 } log_options;
 
 typedef struct {
@@ -97,6 +101,27 @@ static const char *ap_pstrftime(apr_pool_t *p, const char *format, apr_time_exp_
     return buf;
 }
 // namai start
+
+static void create_link(const char *org, const char *linkname, apr_pool_t *p)
+{
+    struct stat stat_buf;
+    apr_finfo_t finfo;
+    apr_ino_t orgInode, linkInode;
+    
+    if (apr_stat(&finfo, org, 0, p) == APR_SUCCESS) {
+        orgInode = finfo.inode;
+    }
+
+    if (apr_stat(&finfo, linkname, 0, p) == APR_SUCCESS) {
+        linkInode = finfo.inode;
+    }
+
+    if(orgInode != linkInode) {
+        apr_file_remove(linkname, p);
+        apr_file_link(org, linkname);
+    }
+}
+
 static int create_subdirs(const char *fullpath, apr_pool_t *ap, server_rec *s)
 {
     char *dirname, *filename;
@@ -124,16 +149,16 @@ static int create_subdirs(const char *fullpath, apr_pool_t *ap, server_rec *s)
     dirname[filename-dirname] = '\0';
 
     if (apr_stat(&finfo, dirname, 0, ap) != APR_SUCCESS) {
-		mode_t oldmask;
-		mode_t newmask;
-		newmask = 0000;
-		oldmask = umask(newmask);
+        mode_t oldmask;
+        mode_t newmask;
+        newmask = 0000;
+        oldmask = umask(newmask);
         if (apr_dir_make_recursive(dirname, 0x0777, ap) != APR_SUCCESS) {
-			umask(oldmask);
+            umask(oldmask);
             apr_pool_destroy(tmp);
             return !OK;
         }
-		umask(oldmask);
+        umask(oldmask);
     }
     apr_pool_destroy(tmp);
     return OK;
@@ -154,7 +179,7 @@ static apr_file_t *ap_open_log(apr_pool_t *p, server_rec *s, const char *base, l
         if (ls->enabled) {
             /* Can't rotate a piped log */
             ls->enabled = 0;
-            ap_log_error(APLOG_MARK, APLOG_WARNING, APR_SUCCESS, s,
+            ap_log_error(APLOG_MARK, APLOG_DEBUG, APR_SUCCESS, s,
                             "disabled log rotation for piped log %s.", base);
         }
 
@@ -181,11 +206,9 @@ static apr_file_t *ap_open_log(apr_pool_t *p, server_rec *s, const char *base, l
 
                 apr_time_exp_gmt(&e, log_time);
                 name = ap_pstrftime(p, name, &e);
-				// namai start
                 if (create_subdirs(name, p, s)!=OK) {
-                    ap_log_error(APLOG_MARK, APLOG_ERR, rv, s, "could not make a directory.");
+                    ap_log_error(APLOG_MARK, APLOG_ERR, rv, s, "could not make a directory. UID=%d EUID=%d", getuid(), geteuid());
                 }
-				// namai end
             } else {
                 /* Synthesize the log name using the specified time in seconds as a
                  * suffix.  We subtract the offset here because it was added when
@@ -198,11 +221,23 @@ static apr_file_t *ap_open_log(apr_pool_t *p, server_rec *s, const char *base, l
             }
         }
 
+        mode_t oldmask;
+        mode_t newmask;
+        newmask = 0111;
+        oldmask = umask(newmask);
+
         if (rv = apr_file_open(&fd, name, xfer_flags, xfer_perms, p), APR_SUCCESS != rv) {
             ap_log_error(APLOG_MARK, APLOG_ERR, rv, s,
-                            "could not open transfer log file %s.", name);
+                            "could not open transfer log file %s. UID=%d EUID=%d", name, getuid(), geteuid());
+            umask(oldmask);
             return NULL;
         }
+
+        const char* hlinkname = apr_hash_get(ls->hardlinks, base, APR_HASH_KEY_STRING);
+        if(hlinkname)
+            create_link(name, hlinkname, p);
+
+        umask(oldmask);
 
         return fd;
     }
@@ -233,6 +268,108 @@ static apr_time_t ap_get_quantized_time(rotated_log *rl, apr_time_t tm) {
 
     return ((tm + rl->st.offset + localadj) / rl->st.interval) * rl->st.interval;
 }
+
+static const char c2x_table[] = "0123456789abcdef";
+
+static APR_INLINE unsigned char *c2x(unsigned what, unsigned char prefix,
+        unsigned char *where)
+{
+#if APR_CHARSET_EBCDIC
+    what = apr_xlate_conv_byte(ap_hdrs_to_ascii, (unsigned char)what);
+#endif /*APR_CHARSET_EBCDIC*/
+    *where++ = prefix;
+    *where++ = c2x_table[what >> 4]; 
+    *where++ = c2x_table[what & 0xf];
+    return where;
+}
+
+
+#define TEST_CHAR(c, f)        (test_char_table[(unsigned)(c)] & (f))
+AP_DECLARE(char *) escape_logitem_without_double_quote(apr_pool_t *p, const char *str)
+{
+    char *ret;
+    unsigned char *d;
+    const unsigned char *s;
+
+    if (!str) {
+        return NULL;
+    }
+
+    ret = apr_palloc(p, 4 * strlen(str) + 1); /* Be safe */
+    d = (unsigned char *)ret;
+    s = (const unsigned char *)str;
+    for (; *s; ++s) {
+
+        // *s!='"' is for JSON
+        if (*s!='"' && TEST_CHAR(*s, T_ESCAPE_LOGITEM)) {
+            *d++ = '\\';
+            switch(*s) {
+                case '\b':
+                    *d++ = 'b';
+                    break;
+                case '\n':
+                    *d++ = 'n';
+                    break;
+                case '\r':
+                    *d++ = 'r';
+                    break;
+                case '\t':
+                    *d++ = 't';
+                    break;
+                case '\v':
+                    *d++ = 'v';
+                    break;
+                case '\\':
+                //case '"': // Fro JSON
+                    *d++ = *s;
+                    break;
+                default:
+                    c2x(*s, 'x', d);
+                    d += 3;
+            }
+        }
+        else {
+            *d++ = *s;
+        }
+    }
+    *d = '\0';
+
+    return ret;
+}
+
+static const char *log_note(request_rec *r, char *a)
+{
+    if(apr_table_get(r->notes, a)==NULL)
+        return "{}";
+    return escape_logitem_without_double_quote(r->pool, apr_table_get(r->notes, a));
+}
+
+static const char *log_note_array(request_rec *r, char *a)
+{
+    if(apr_table_get(r->notes, a)==NULL)
+        return "[]";
+    return escape_logitem_without_double_quote(r->pool, apr_table_get(r->notes, a));
+}
+
+
+/*
+ * register us for the mod_log_config function registering phase   
+ * to establish %{...}c and to be able to expand %{...}x variables.
+ */
+static int rotate_hook_pre_config(apr_pool_t *pconf, apr_pool_t *plog, apr_pool_t *ptemp)
+{
+    static APR_OPTIONAL_FN_TYPE(ap_register_log_handler) *log_pfn_register;
+
+    log_pfn_register = APR_RETRIEVE_OPTIONAL_FN(ap_register_log_handler);
+
+    if (log_pfn_register)
+    {
+        log_pfn_register(pconf, "j", log_note, 0); // json
+        log_pfn_register(pconf, "J", log_note_array, 0); // json array
+    }
+    return OK;
+}
+
 
 /* Called by mod_log_config to write a log file line.
  */
@@ -415,6 +552,13 @@ static const char *set_interval(cmd_parms *cmd, void *dummy,
     return NULL;
 }
 
+static const char *set_hardlink(cmd_parms *cmd, void *dummy, const char* key, const char* val)
+{
+    log_options *ls = ap_get_module_config(cmd->server->module_config, &log_rotate_module);
+    apr_hash_set(ls->hardlinks, key, APR_HASH_KEY_STRING, val);
+    return NULL;
+}
+
 static const command_rec rotate_log_cmds[] = {
     AP_INIT_FLAG(  "RotateLogs", set_rotated_logs, NULL, RSRC_CONF,
                    "Enable rotated logging"),
@@ -423,6 +567,8 @@ static const command_rec rotate_log_cmds[] = {
     AP_INIT_TAKE12("RotateInterval", set_interval, NULL, RSRC_CONF,
                    "Set rotation interval in seconds with"
                    " optional offset in minutes"),
+    AP_INIT_TAKE2("RotateLogsHardLink", set_hardlink, NULL, RSRC_CONF,
+                  "Make hardlink to current log"),
     {NULL}
 };
 
@@ -434,6 +580,7 @@ static void *make_log_options(apr_pool_t *p, server_rec *s) {
     ls->interval    = INTERVAL_DEFAULT;
     ls->offset      = 0;
     ls->localt      = 0;
+    ls->hardlinks   = apr_hash_make(p);
 
     return ls;
 }
@@ -447,6 +594,11 @@ static void *merge_log_options(apr_pool_t *p, void *basev, void *addv) {
     return add;
 }
 
+static void rotate_register_hooks(apr_pool_t *p)
+{
+    ap_hook_pre_config    (rotate_hook_pre_config,    NULL,NULL, APR_HOOK_MIDDLE);
+}
+
 module AP_MODULE_DECLARE_DATA log_rotate_module = {
     STANDARD20_MODULE_STUFF,
     NULL,                       /* create per-dir config */
@@ -454,6 +606,6 @@ module AP_MODULE_DECLARE_DATA log_rotate_module = {
     make_log_options,           /* server config */
     merge_log_options,          /* merge server config */
     rotate_log_cmds,            /* command apr_table_t */
-    NULL                        /* register hooks */
+    rotate_register_hooks       /* register hooks */
 };
 
