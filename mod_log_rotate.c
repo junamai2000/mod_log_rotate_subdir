@@ -102,7 +102,7 @@ static const char *ap_pstrftime(apr_pool_t *p, const char *format, apr_time_exp_
 }
 // namai start
 
-static void create_link(const char *org, const char *linkname, apr_pool_t *p)
+static void create_link(const char *org, const char *linkname, apr_pool_t *p, apr_status_t rv, server_rec *s)
 {
     struct stat stat_buf;
     apr_finfo_t finfo;
@@ -114,11 +114,18 @@ static void create_link(const char *org, const char *linkname, apr_pool_t *p)
 
     if (apr_stat(&finfo, linkname, 0, p) == APR_SUCCESS) {
         linkInode = finfo.inode;
+    } else {
+        if(apr_file_link(org, linkname) != APR_SUCCESS)
+            ap_log_error(APLOG_MARK, APLOG_ERR, rv, s, "fail to link from=%s, to=%s", org, linkname);
+        return;
     }
 
     if(orgInode != linkInode) {
-        apr_file_remove(linkname, p);
-        apr_file_link(org, linkname);
+        if(apr_file_remove(linkname, p) != APR_SUCCESS)
+            ap_log_error(APLOG_MARK, APLOG_ERR, rv, s, "fail to remove link=%s", linkname);
+
+        if(apr_file_link(org, linkname) != APR_SUCCESS)
+            ap_log_error(APLOG_MARK, APLOG_ERR, rv, s, "inode is different, but fail to link from=%s, to=%s", org, linkname);
     }
 }
 
@@ -233,9 +240,21 @@ static apr_file_t *ap_open_log(apr_pool_t *p, server_rec *s, const char *base, l
             return NULL;
         }
 
+        /*** DEBUG
+        apr_hash_index_t *hi;
+        void *key, *val;
+        for (hi = apr_hash_first(p, ls->hardlinks); hi; hi = apr_hash_next(hi))
+        {
+            apr_hash_this(hi,(void*)&key, NULL, (void*)&val);
+            char *k = (char*)key;
+            char *v = (char*)val;
+            ap_log_error(APLOG_MARK, APLOG_ERR, rv, s, "dump => s=%s, v=%s | base=%s", k, v, base);
+        }
+        */
+
         const char* hlinkname = apr_hash_get(ls->hardlinks, base, APR_HASH_KEY_STRING);
         if(hlinkname)
-            create_link(name, hlinkname, p);
+            create_link(name, hlinkname, p, rv, s);
 
         umask(oldmask);
 
@@ -580,7 +599,7 @@ static void *make_log_options(apr_pool_t *p, server_rec *s) {
     ls->interval    = INTERVAL_DEFAULT;
     ls->offset      = 0;
     ls->localt      = 0;
-    ls->hardlinks   = apr_hash_make(p);
+    ls->hardlinks = apr_hash_make(p);
 
     return ls;
 }
